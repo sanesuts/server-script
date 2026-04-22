@@ -2,94 +2,118 @@
 set -euo pipefail
 
 # -----------------------------
-# Usage
+# USAGE
 # -----------------------------
 usage() {
   echo "Usage:"
-  echo "  sudo $0 -c <connection> -i <ip/cidr> -g <gateway> -d <dns1,dns2>"
+  echo "  sudo $0 -i <ip/cidr> -d <dns1,dns2> [-c <new-conn-name>]"
   echo ""
   echo "Exemple:"
-  echo "  sudo $0 -c 'Wired connection 1' -i 192.168.1.156/24 -g 192.168.1.1 -d 1.1.1.1,8.8.8.8"
+  echo "  sudo $0 -i 192.168.1.156/24 -d 1.1.1.1,8.8.8.8 -c static-eth"
   exit 1
 }
 
 # -----------------------------
-# Args
+# ARGS
 # -----------------------------
-while getopts "c:i:g:d:" opt; do
+while getopts "i:d:c:" opt; do
   case "$opt" in
-    c) CONN="$OPTARG" ;;
     i) IP="$OPTARG" ;;
-    g) GW="$OPTARG" ;;
     d) DNS="$OPTARG" ;;
+    c) NEWCONN="$OPTARG" ;;
     *) usage ;;
   esac
 done
 
-if [[ -z "${CONN:-}" || -z "${IP:-}" || -z "${GW:-}" || -z "${DNS:-}" ]]; then
-  usage
+[[ -z "${IP:-}" || -z "${DNS:-}" ]] && usage
+
+NEWCONN="${NEWCONN:-static-conn-$(date +%s)}"
+
+# -----------------------------
+# AUTO DETECTION INTERFACE
+# -----------------------------
+IFACE=$(nmcli -t -f DEVICE,STATE device | grep connected | head -n1 | cut -d: -f1)
+
+if [[ -z "$IFACE" ]]; then
+  echo "❌ Impossible de détecter l'interface active"
+  exit 1
 fi
 
-echo "🔧 Configuration IP fixe via NetworkManager"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "Connexion : $CONN"
-echo "IP        : $IP"
-echo "Gateway   : $GW"
-echo "DNS       : $DNS"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+# -----------------------------
+# AUTO DETECTION GATEWAY
+# -----------------------------
+GW=$(ip route | grep default | awk '{print $3}' | head -n1)
 
-# -----------------------------
-# Vérif connexion
-# -----------------------------
-nmcli connection show | grep -q "$CONN" || {
-  echo "❌ Connexion introuvable : $CONN"
+if [[ -z "$GW" ]]; then
+  echo "❌ Impossible de détecter la gateway"
   exit 1
-}
+fi
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "📡 Interface détectée : $IFACE"
+echo "🚪 Gateway détectée   : $GW"
+echo "🌐 IP cible           : $IP"
+echo "🔎 DNS                : $DNS"
+echo "🧷 Nouvelle connexion : $NEWCONN"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 # -----------------------------
-# Passage en manuel (IMPORTANT)
+# CRÉATION NOUVELLE CONNEXION
 # -----------------------------
-echo "⚙️ Passage en mode IP statique..."
-sudo nmcli connection modify "$CONN" ipv4.method manual
+echo "🧷 Création nouvelle connexion..."
+
+sudo nmcli connection add \
+  type ethernet \
+  ifname "$IFACE" \
+  con-name "$NEWCONN" \
+  ipv4.method manual \
+  ipv4.addresses "$IP" \
+  ipv4.gateway "$GW" \
+  ipv4.dns "$(echo $DNS | tr ',' ' ')" \
+  autoconnect yes
 
 # -----------------------------
-# Nettoyage ancien DHCP
+# SAFE APPLY (ROLLBACK SYSTEM)
 # -----------------------------
-echo "🧹 Nettoyage ancienne config DHCP..."
-sudo nmcli connection modify "$CONN" ipv4.addresses ""
-sudo nmcli connection modify "$CONN" ipv4.gateway ""
-sudo nmcli connection modify "$CONN" ipv4.dns ""
+echo "🚨 Activation avec rollback sécurité..."
 
-# -----------------------------
-# Application config
-# -----------------------------
-echo "🌐 Application IP..."
-sudo nmcli connection modify "$CONN" ipv4.addresses "$IP"
+OLD_CONN=$(nmcli -t -f NAME,DEVICE connection show --active | grep "$IFACE" | cut -d: -f1 || true)
 
-echo "🚪 Application gateway..."
-sudo nmcli connection modify "$CONN" ipv4.gateway "$GW"
-
-DNS_FMT=$(echo "$DNS" | tr ',' ' ')
-echo "🔎 Application DNS..."
-sudo nmcli connection modify "$CONN" ipv4.dns "$DNS_FMT"
+sudo nmcli connection up "$NEWCONN"
 
 # -----------------------------
-# Restart connexion
+# TEST CONNECTIVITÉ
 # -----------------------------
-echo "🔄 Redémarrage connexion..."
-sudo nmcli connection down "$CONN" || true
-sudo nmcli connection up "$CONN"
+echo "🧪 Test connectivité (ping gateway)..."
 
-# -----------------------------
-# Vérification
-# -----------------------------
-DEVICE=$(nmcli -t -f NAME,DEVICE connection show | grep "^$CONN:" | cut -d: -f2)
+sleep 3
 
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "✅ CONFIG TERMINÉE"
-echo "📡 Interface : $DEVICE"
+if ping -c 3 "$GW" >/dev/null 2>&1; then
+    echo "✅ Réseau OK, validation config"
 
-echo "📊 IP actuelle :"
-ip -4 addr show "$DEVICE" | grep inet || true
+    # désactiver ancienne connexion si elle existe
+    if [[ -n "$OLD_CONN" ]]; then
+        echo "🧹 Désactivation ancienne connexion : $OLD_CONN"
+        sudo nmcli connection down "$OLD_CONN" || true
+    fi
 
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "🎉 CONFIG APPLIQUÉE AVEC SUCCÈS"
+    echo "📡 Interface : $IFACE"
+    echo "🧷 Connexion : $NEWCONN"
+    ip -4 addr show "$IFACE" | grep inet
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+else
+    echo "❌ PERTE DE CONNECTIVITÉ → ROLLBACK"
+
+    sudo nmcli connection down "$NEWCONN" || true
+
+    if [[ -n "$OLD_CONN" ]]; then
+        echo "🔁 Restauration ancienne connexion : $OLD_CONN"
+        sudo nmcli connection up "$OLD_CONN" || true
+    fi
+
+    echo "⚠️ Rollback terminé"
+    exit 1
+fi
